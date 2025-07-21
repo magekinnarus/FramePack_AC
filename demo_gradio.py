@@ -23,7 +23,7 @@ from transformers import SiglipImageProcessor, SiglipVisionModel
 from diffusers_helper.clip_vision import hf_clip_vision_encode
 from diffusers_helper.dit_common import *
 from diffusers_helper.gradio.progress_bar import make_progress_bar_html, make_progress_bar_css
-from bucket_tools import bucket_options, find_nearest_bucket
+from diffusers_helper.bucket_tools import bucket_options, find_nearest_bucket
 
 stream = AsyncStream()
 
