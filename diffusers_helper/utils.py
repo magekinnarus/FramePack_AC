@@ -250,8 +250,12 @@ def uniform_random_by_intervals(inclusive, exclusive, n, round_to_int=False):
 
 
 def soft_append_bcthw(history, current, overlap=0):
+    if history is None:
+        return current, current.shape[2]
+
     if overlap <= 0:
-        return torch.cat([history, current], dim=2)
+        combined = torch.cat([history, current], dim=2)
+        return combined, combined.shape[2]
 
     assert history.shape[2] >= overlap, f"History length ({history.shape[2]}) must be >= overlap ({overlap})"
     assert current.shape[2] >= overlap, f"Current length ({current.shape[2]}) must be >= overlap ({overlap})"
@@ -260,7 +264,7 @@ def soft_append_bcthw(history, current, overlap=0):
     blended = weights * history[:, :, -overlap:] + (1 - weights) * current[:, :, :overlap]
     output = torch.cat([history[:, :, :-overlap], blended, current[:, :, overlap:]], dim=2)
 
-    return output.to(history)
+    return output.to(history), output.shape[2]
 
 
 def save_bcthw_as_mp4(x, output_filename, fps=10, crf=0):
@@ -611,3 +615,36 @@ def move_optimizer_to_device(optimizer, device):
         for k, v in state.items():
             if isinstance(v, torch.Tensor):
                 state[k] = v.to(device)
+
+
+def save_bcthw_as_png_sequence(x, output_folder, file_prefix='frame'):
+    """
+    Saves a BCTHW video tensor as a sequence of PNG images.
+
+    Args:
+        x (torch.Tensor): The video tensor in BCTHW format.
+        output_folder (str): The directory to save the PNG files.
+        file_prefix (str): The prefix for the output filenames.
+    """
+    assert x.dim() == 5, "Input tensor must be 5-dimensional (B, C, T, H, W)"
+    os.makedirs(output_folder, exist_ok=True)
+
+    # Process the first element in the batch
+    video_tensor = x[0]  # Shape: C, T, H, W
+    num_frames = video_tensor.shape[1]
+
+    for i in range(num_frames):
+        # Extract the i-th frame, shape will be C, H, W
+        frame_tensor_chw = video_tensor[:, i, :, :]
+
+        # Add a batch dimension to match save_bchw_as_png's expectation (B, C, H, W)
+        frame_tensor_bchw = frame_tensor_chw.unsqueeze(0)
+
+        # Format filename with padding
+        output_filename = os.path.join(output_folder, f"{file_prefix}_{i:05d}.png")
+
+        # Use the existing helper function to save the frame
+        save_bchw_as_png(frame_tensor_bchw, output_filename)
+
+    print(f"Saved {num_frames} frames to {output_folder}")
+    return output_folder
