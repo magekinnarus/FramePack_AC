@@ -280,23 +280,6 @@ def save_bcthw_as_mp4(x, output_filename, fps=10, crf=0):
     return x
 
 
-def save_bcthw_as_png_sequence(x, output_dir, file_prefix='frame'):
-    os.makedirs(output_dir, exist_ok=True)
-    b, c, t, h, w = x.shape
-    x = torch.clamp(x.float(), -1., 1.) * 127.5 + 127.5
-    x = x.detach().cpu().to(torch.uint8)
-    
-    # Assuming batch size is 1 for sequence saving
-    x = x.squeeze(0) # T, C, H, W -> C, T, H, W ? No, should be C, H, W per frame
-    
-    for i in range(t):
-        frame = x[:, i, :, :] # C, H, W
-        output_filename = os.path.join(output_dir, f"{file_prefix}_{i:05d}.png")
-        torchvision.io.write_png(frame, output_filename)
-        
-    return output_dir
-
-
 def save_bcthw_as_png(x, output_filename):
     os.makedirs(os.path.dirname(os.path.abspath(os.path.realpath(output_filename))), exist_ok=True)
     x = torch.clamp(x.float(), -1., 1.) * 127.5 + 127.5

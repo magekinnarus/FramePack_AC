@@ -17,7 +17,7 @@ from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
 from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
 from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
-from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp, save_bcthw_as_png_sequence
+from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
@@ -99,7 +99,7 @@ os.makedirs(outputs_folder, exist_ok=True)
 
 
 @torch.no_grad()
-def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, save_as_png_sequence):
+def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -325,10 +325,6 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
             stream.output_queue.push(('file', output_filename))
 
             if is_last_section:
-                if save_as_png_sequence:
-                    png_sequence_dir = os.path.join(outputs_folder, job_id)
-                    stream.output_queue.push(('progress', (None, f'Saving PNG sequence to {png_sequence_dir}', make_progress_bar_html(100, 'Saving...'))))
-                    save_bcthw_as_png_sequence(history_pixels, png_sequence_dir)
                 break
     except:
         traceback.print_exc()
@@ -342,7 +338,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
     return
 
 
-def process(input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, save_as_png_sequence):
+def process(input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
     global stream
     assert input_image is not None, 'No input image!'
 
@@ -350,7 +346,7 @@ def process(input_image, end_image, prompt, n_prompt, seed, total_second_length,
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, save_as_png_sequence)
+    async_run(worker, input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf)
 
     output_filename = None
 
@@ -418,8 +414,6 @@ with block:
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
                 
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
-                
-                save_as_png_sequence = gr.Checkbox(label="Save as PNG Sequence", value=False, info="Saves the final video as a PNG sequence in a subfolder inside 'outputs'.")
 
         with gr.Column():
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
@@ -430,7 +424,7 @@ with block:
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
     
-    ips = [input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, save_as_png_sequence]
+    ips = [input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 
