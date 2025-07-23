@@ -201,8 +201,17 @@ class HunyuanAttnProcessorFlashAttnSingle:
 
         txt_length = encoder_hidden_states.shape[1]
 
-        query = torch.cat([apply_rotary_emb_transposed(query[:, :-txt_length], image_rotary_emb), query[:, -txt_length:]], dim=1)
-        key = torch.cat([apply_rotary_emb_transposed(key[:, :-txt_length], image_rotary_emb), key[:, -txt_length:]], dim=1)
+        # Fix 2: Slice rotary embedding for the image part of the query
+        image_query_part = query[:, :-txt_length]
+        sliced_image_rotary_emb = image_rotary_emb[:, :image_query_part.shape[1]]
+        rotated_query = apply_rotary_emb_transposed(image_query_part, sliced_image_rotary_emb)
+        query = torch.cat([rotated_query, query[:, -txt_length:]], dim=1)
+
+        # Fix 2: Slice rotary embedding for the image part of the key
+        image_key_part = key[:, :-txt_length]
+        # sliced_image_rotary_emb is already computed and can be reused
+        rotated_key = apply_rotary_emb_transposed(image_key_part, sliced_image_rotary_emb)
+        key = torch.cat([rotated_key, key[:, -txt_length:]], dim=1)
 
         hidden_states = attn_varlen_func(query, key, value, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
         hidden_states = hidden_states.flatten(-2)
