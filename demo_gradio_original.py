@@ -18,7 +18,7 @@ from diffusers import AutoencoderKLHunyuanVideo
 from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
 from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
 from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
-from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
+from diffusers_helper.models.hunyuan_video_packed_pre1 import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
 from diffusers_helper.thread_utils import AsyncStream, async_run

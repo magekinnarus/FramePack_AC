@@ -642,21 +642,18 @@ class HunyuanVideoTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        rope_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # 1. Input normalization
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
         norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(encoder_hidden_states, emb=temb)
 
-        # Fix: Slice the rotary embedding to match the sequence length of the hidden_states tensor.
-        sliced_rope_freqs = rope_freqs[:, : hidden_states.shape[1]]
-        
         # 2. Joint attention
         attn_output, context_attn_output = self.attn(
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             attention_mask=attention_mask,
-            image_rotary_emb=sliced_rope_freqs,
+            image_rotary_emb=freqs_cis,
         )
 
         # 3. Modulation and residual connection
