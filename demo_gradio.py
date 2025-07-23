@@ -233,7 +233,7 @@ def worker(all_keyframes, all_prompts, n_prompt, perform_open_ended, seed, incre
                 if not high_vram: load_model_as_complete(vae, target_device=gpu)
                 start_latent = vae_encode(start_image_pt, vae)
                 
-                if end_image_for_run:
+                if end_image_for_run is not None:
                     end_image_np = resize_and_center_crop(end_image_for_run, target_width=width, target_height=height)
                     end_image_pt = torch.from_numpy(end_image_np).float() / 127.5 - 1
                     end_image_pt = end_image_pt.permute(2, 0, 1)[None, :, None]
@@ -245,7 +245,7 @@ def worker(all_keyframes, all_prompts, n_prompt, perform_open_ended, seed, incre
                 if not high_vram: load_model_as_complete(image_encoder, target_device=gpu)
                 image_encoder_output = hf_clip_vision_encode(start_image_np, feature_extractor, image_encoder)
                 image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
-                if end_image_for_run:
+                if end_image_for_run is not None:
                     end_image_encoder_output = hf_clip_vision_encode(end_image_np, feature_extractor, image_encoder)
                     image_encoder_last_hidden_state = (image_encoder_last_hidden_state + end_image_encoder_output.last_hidden_state) / 2
 
