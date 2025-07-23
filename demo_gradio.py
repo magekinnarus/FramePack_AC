@@ -365,7 +365,7 @@ def process(k1, k2, k3, k4, k5, p1, p2, p3, p4, p5, n_prompt, open_ended, seed, 
             yield output_filename, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), gr.update(interactive=True)
         elif flag == 'progress_update':
             preview, desc, html, overall_progress = data
-            yield gr.update(), gr.update(visible=True, value=preview), desc, html, overall_progress, gr.update(interactive=False), gr.update(interactive=True), gr.update(interactive=True)
+            yield gr.update(), gr.update(visible=True, value=preview), desc, html, overall_progress*100, gr.update(interactive=False), gr.update(interactive=True), gr.update(interactive=True)
         elif flag == 'end':
             yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(), gr.update(interactive=True), gr.update(interactive=False), gr.update(interactive=False)
             break
@@ -463,7 +463,7 @@ with block:
             gr.Markdown("---")
             gr.Markdown("### Progress")
             gr.Markdown("Overall Session Progress")
-            overall_progress = gr.Progress()
+            overall_progress = gr.Slider(label="Overall Session Progress", minimum=0, maximum=100, value=0, step=0.1, interactive=False, elem_classes='no-generating-animation')
             preview_image = gr.Image(label="Current Run Latent Preview", height=200, visible=False)
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
             progress_bar = gr.HTML('', elem_classes='no-generating-animation', label="Current Run Progress")
