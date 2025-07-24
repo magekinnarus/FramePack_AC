@@ -55,7 +55,6 @@ image_encoder = SiglipVisionModel.from_pretrained(os.path.join(DOWNLOAD_ROOT, 'f
 
 transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(os.path.join(DOWNLOAD_ROOT, 'framepack_transformer'), torch_dtype=torch.bfloat16).cpu()
 
-
 vae.eval()
 text_encoder.eval()
 text_encoder_2.eval()
@@ -148,29 +147,68 @@ def worker(all_keyframes, all_prompts, n_prompt, perform_open_ended, seed, incre
         parsed_lengths = [4.0]
 
     try:
-        # --- Initialization ---
-        stream.output_queue.push(('progress_update', (None, 'Initializing...', make_progress_bar_html(0, 'Init...'), 0.0)))
+        # --- Initialization from Keyframe 1 ---
+        stream.output_queue.push(('progress_update', (None, 'Initializing from Keyframe 1...', make_progress_bar_html(0, 'Init...'), 0.0)))
+        
+        # Determine consistent dimensions from the first keyframe
         H, W, C = keyframe_sequence[0].shape
         height, width = find_nearest_bucket(H, W, resolution=640)
-        history_pixels = None
 
-        # --- Main Orchestration Loop (Per Storyboard Run) ---
+        if not high_vram: load_model_as_complete(vae, target_device=gpu)
+        
+        # Process, encode, and decode the very first frame to start the history
+        kf1_np = resize_and_center_crop(keyframe_sequence[0], target_width=width, target_height=height)
+        kf1_pt = torch.from_numpy(kf1_np).float() / 127.5 - 1
+        kf1_pt = kf1_pt.permute(2, 0, 1)[None, :, None]
+        
+        initial_latent = vae_encode(kf1_pt, vae)
+        history_pixels = vae_decode(initial_latent, vae).cpu()
+        
+        # The initial latent has a single time dimension. This becomes our master latent history.
+        history_latents = initial_latent.cpu()
+        
+        if not high_vram: unload_complete_models(vae)
+
+        # --- Main Orchestration Loop ---
         for i in range(num_runs):
+            # Pre-run check for stop signal
             if stream.input_queue.top() == 'stop_all_runs':
-                stream.input_queue.pop()
+                stream.input_queue.pop() # Consume the signal
                 stream.output_queue.push(('progress_update', (None, 'All runs stopped by user.', make_progress_bar_html(100, 'Stopped'), 1.0)))
                 break
 
             run_index = i + 1
             
+            # --- Prepare Context from History ---
+            history_len = history_latents.shape[2]
+            
+            # Context for 2x downsampling (needs 2 frames)
+            if history_len < 2:
+                padding_shape = list(history_latents.shape)
+                padding_shape[2] = 2 - history_len
+                padding = torch.zeros(padding_shape, dtype=history_latents.dtype, device=history_latents.device)
+                context_2x_latents = torch.cat([padding, history_latents], dim=2)
+            else:
+                context_2x_latents = history_latents[:, :, -2:]
+
+            # Context for 4x downsampling (needs 16 frames)
+            if history_len < 16:
+                padding_shape = list(history_latents.shape)
+                padding_shape[2] = 16 - history_len
+                padding = torch.zeros(padding_shape, dtype=history_latents.dtype, device=history_latents.device)
+                context_4x_latents = torch.cat([padding, history_latents], dim=2)
+            else:
+                context_4x_latents = history_latents[:, :, -16:]
+
             # --- Per-Run Setup ---
             start_image_for_run = keyframe_sequence[i]
             is_open_ended_run = (i == num_runs - 1) and perform_open_ended
             end_image_for_run = None if is_open_ended_run else keyframe_sequence[i + 1]
-            has_end_image = end_image_for_run is not None
             prompt_for_run = processed_prompts[i]
             
             length_for_this_run = parsed_lengths[i] if i < len(parsed_lengths) else parsed_lengths[-1]
+            num_frames_to_generate = int(length_for_this_run * 30)
+
             current_seed_for_run = seed + i if increment_seed else seed
             
             # --- Per-Run Execution Logic ---
@@ -186,137 +224,112 @@ def worker(all_keyframes, all_prompts, n_prompt, perform_open_ended, seed, incre
                 llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
                 llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
 
-                # VAE and CLIP Vision Encoding for start/end frames of this run
-                if not high_vram: load_model_as_complete(vae, target_device=gpu)
+                # Image Processing
                 start_image_np = resize_and_center_crop(start_image_for_run, target_width=width, target_height=height)
-                start_image_pt = (torch.from_numpy(start_image_np).float() / 127.5 - 1).permute(2, 0, 1)[None, :, None]
+                start_image_pt = torch.from_numpy(start_image_np).float() / 127.5 - 1
+                start_image_pt = start_image_pt.permute(2, 0, 1)[None, :, None]
+
+                # VAE Encoding
+                if not high_vram: load_model_as_complete(vae, target_device=gpu)
                 start_latent = vae_encode(start_image_pt, vae)
                 
-                if has_end_image:
+                if end_image_for_run is not None:
                     end_image_np = resize_and_center_crop(end_image_for_run, target_width=width, target_height=height)
-                    end_image_pt = (torch.from_numpy(end_image_np).float() / 127.5 - 1).permute(2, 0, 1)[None, :, None]
+                    end_image_pt = torch.from_numpy(end_image_np).float() / 127.5 - 1
+                    end_image_pt = end_image_pt.permute(2, 0, 1)[None, :, None]
                     end_latent = vae_encode(end_image_pt, vae)
+                else:
+                    end_latent = None
 
+                # CLIP Vision Encoding
                 if not high_vram: load_model_as_complete(image_encoder, target_device=gpu)
                 image_encoder_output = hf_clip_vision_encode(start_image_np, feature_extractor, image_encoder)
                 image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
-                if has_end_image:
+                if end_image_for_run is not None:
                     end_image_encoder_output = hf_clip_vision_encode(end_image_np, feature_extractor, image_encoder)
                     image_encoder_last_hidden_state = (image_encoder_last_hidden_state + end_image_encoder_output.last_hidden_state) / 2
 
+                # Data types and device placement
                 llama_vec, llama_vec_n, clip_l_pooler, clip_l_pooler_n, image_encoder_last_hidden_state = [t.to(transformer.dtype) for t in [llama_vec, llama_vec_n, clip_l_pooler, clip_l_pooler_n, image_encoder_last_hidden_state]]
 
-                # --- Memory-Safe Chunking Loop (Inner Loop) ---
-                total_latent_sections = (length_for_this_run * 30) / (latent_window_size * 4)
-                total_latent_sections = int(max(round(total_latent_sections), 1))
-                
-                latent_paddings = list(reversed(range(total_latent_sections)))
-                if total_latent_sections > 4:
-                    latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
+                # Sampling
+                stream.output_queue.push(('progress_update', (None, f'Run {run_index}/{num_runs}: Sampling (Seed: {current_seed_for_run}, Length: {length_for_this_run}s)...', make_progress_bar_html(0, 'Sampling...'), i / num_runs)))
+                if not high_vram:
+                    unload_complete_models()
+                    move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+
+                transformer.initialize_teacache(enable_teacache=use_teacache, num_steps=steps)
 
                 rnd = torch.Generator("cpu").manual_seed(current_seed_for_run)
-                chunk_history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
-                total_generated_latent_frames_in_run = 0
 
-                for chunk_idx, latent_padding in enumerate(latent_paddings):
-                    is_last_section = latent_padding == 0
-                    is_first_section = latent_padding == latent_paddings[0]
-                    latent_padding_size = latent_padding * latent_window_size
+                # Callback for progress and control
+                def callback(d):
+                    signal = stream.input_queue.top() # Peek, don't pop
+                    if signal in ['skip_current_run', 'stop_all_runs']:
+                        raise KeyboardInterrupt()
 
-                    stream.output_queue.push(('progress_update', (None, f'Run {run_index}/{num_runs}, Chunk {chunk_idx+1}/{len(latent_paddings)}... (Seed: {current_seed_for_run})', make_progress_bar_html(0, 'Sampling chunk...'), (i + chunk_idx/len(latent_paddings)) / num_runs )))
-                    
-                    indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
-                    clean_latent_indices_pre, _, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
-                    clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+                    preview = vae_decode_fake(d['denoised'])
+                    preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
+                    preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
 
-                    clean_latents_pre = start_latent.to(chunk_history_latents)
-                    clean_latents_post, clean_latents_2x, clean_latents_4x = chunk_history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
-                    
-                    if has_end_image and is_first_section:
-                        clean_latents_post = end_latent.to(chunk_history_latents)
-                    
-                    clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
-                    
-                    if not high_vram:
-                        unload_complete_models()
-                        move_model_to_device_with_memory_preservation(transformer, gpu, gpu_memory_preservation)
-                    
-                    transformer.initialize_teacache(enable_teacache=use_teacache, num_steps=steps)
+                    current_step = d['i'] + 1
+                    percentage = int(100.0 * current_step / steps)
+                    hint = f'Sampling {current_step}/{steps}'
+                    desc = f'Run {run_index}/{num_runs}. Total video length: {(history_pixels.shape[2] / 30.0):.2f}s'
+                    run_progress = (i + (current_step / steps)) / num_runs
+                    stream.output_queue.push(('progress_update', (preview, desc, make_progress_bar_html(percentage, hint), run_progress)))
 
-                    def callback(d):
-                        signal = stream.input_queue.top()
-                        if signal in ['skip_current_run', 'stop_all_runs']:
-                            raise KeyboardInterrupt()
+                # Setup latent indices and clean latents for this run
+                indices = torch.arange(0, sum([1, 0, num_frames_to_generate, 1, 2, 16])).unsqueeze(0)
+                clean_latent_indices_pre, _, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, 0, num_frames_to_generate, 1, 2, 16], dim=1)
+                clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+                
+                # Anchor latents for the current run
+                clean_latents_for_run = torch.cat(
+                    [start_latent, end_latent if end_latent is not None else torch.zeros_like(start_latent)], 
+                    dim=2
+                )
 
-                        preview = vae_decode_fake(d['denoised'])
-                        preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
-                        preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
+                generated_latents = sample_hunyuan(
+                    transformer=transformer, sampler='unipc', width=width, height=height, frames=num_frames_to_generate,
+                    real_guidance_scale=cfg, distilled_guidance_scale=gs, guidance_rescale=rs,
+                    num_inference_steps=steps, generator=rnd,
+                    prompt_embeds=llama_vec, prompt_embeds_mask=llama_attention_mask, prompt_poolers=clip_l_pooler,
+                    negative_prompt_embeds=llama_vec_n, negative_prompt_embeds_mask=llama_attention_mask_n, negative_prompt_poolers=clip_l_pooler_n,
+                    device=gpu, dtype=torch.bfloat16, image_embeddings=image_encoder_last_hidden_state,
+                    latent_indices=latent_indices, 
+                    clean_latents=clean_latents_for_run, clean_latent_indices=clean_latent_indices,
+                    clean_latents_2x=context_2x_latents, clean_latent_2x_indices=clean_latent_2x_indices,
+                    clean_latents_4x=context_4x_latents, clean_latent_4x_indices=clean_latent_4x_indices,
+                    callback=callback,
+                )
 
-                        current_step = d['i'] + 1
-                        percentage = int(100.0 * current_step / steps)
-                        hint = f'Sampling {current_step}/{steps}'
-                        desc = f'Run {run_index}/{num_runs}, Chunk {chunk_idx+1}/{len(latent_paddings)}. Total video length: {((history_pixels.shape[2] if history_pixels is not None else 0) / 30.0):.2f}s'
-                        run_progress = (i + (chunk_idx + current_step/steps) / len(latent_paddings)) / num_runs
-                        stream.output_queue.push(('progress_update', (preview, desc, make_progress_bar_html(percentage, hint), run_progress)))
+                # --- VAE Decode and History Update ---
+                if not high_vram:
+                    offload_model_from_device_for_memory_preservation(transformer, gpu, 8)
+                    load_model_as_complete(vae, gpu)
 
-                    num_frames_in_chunk = latent_window_size * 4 - 3
-                    
-                    generated_latents_chunk = sample_hunyuan(
-                        transformer=transformer, sampler='unipc', width=width, height=height, frames=num_frames_in_chunk,
-                        real_guidance_scale=cfg, distilled_guidance_scale=gs, guidance_rescale=rs,
-                        num_inference_steps=steps, generator=rnd,
-                        prompt_embeds=llama_vec, prompt_embeds_mask=llama_attention_mask, prompt_poolers=clip_l_pooler,
-                        negative_prompt_embeds=llama_vec_n, negative_prompt_embeds_mask=llama_attention_mask_n, negative_prompt_poolers=clip_l_pooler_n,
-                        device=gpu, dtype=torch.bfloat16, image_embeddings=image_encoder_last_hidden_state,
-                        latent_indices=latent_indices, clean_latents=clean_latents, clean_latent_indices=clean_latent_indices,
-                        clean_latents_2x=clean_latents_2x, clean_latent_2x_indices=clean_latent_2x_indices,
-                        clean_latents_4x=clean_latents_4x, clean_latent_4x_indices=clean_latent_4x_indices,
-                        callback=callback,
-                    )
-
-                    if is_last_section:
-                        generated_latents_chunk = torch.cat([start_latent.to(generated_latents_chunk), generated_latents_chunk], dim=2)
-                    
-                    total_generated_latent_frames_in_run += generated_latents_chunk.shape[2]
-                    chunk_history_latents = torch.cat([generated_latents_chunk.to(chunk_history_latents), chunk_history_latents], dim=2)
-
-                    if not high_vram:
-                        offload_model_from_device_for_memory_preservation(transformer, gpu, 8)
-                        load_model_as_complete(vae, gpu)
-
-                    real_chunk_history_latents = chunk_history_latents[:, :, :total_generated_latent_frames_in_run]
-
-                    if history_pixels is None:
-                        history_pixels = vae_decode(real_chunk_history_latents, vae).cpu()
-                    else:
-                        section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
-                        overlapped_frames = latent_window_size * 4 - 3
-                        
-                        current_pixels = vae_decode(real_chunk_history_latents[:, :, :section_latent_frames], vae).cpu()
-                        history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
-
-                    if not high_vram: unload_complete_models()
-
-                    output_filename = os.path.join(session_folder, f'run_{run_index}_cumulative.mp4')
-                    save_bcthw_as_mp4(history_pixels, output_filename, fps=30, crf=mp4_crf)
-                    stream.output_queue.push(('file', output_filename))
-                    
-                    if is_last_section:
-                        break # Exit the inner chunking loop for this run
-            
+                current_pixels = vae_decode(generated_latents, vae).cpu()
+                
+                # The last frame of history IS the first frame of the new segment. Blend over it.
+                history_pixels = soft_append_bcthw(history_pixels, current_pixels, overlap=1)
+                
+                # Update the master latent history, excluding the duplicated first frame of the new segment
+                history_latents = torch.cat([history_latents, generated_latents.cpu()[:, :, 1:]], dim=2)
+                
             except KeyboardInterrupt:
-                signal = stream.input_queue.pop()
+                signal = stream.input_queue.pop() # Consume the signal now
                 if signal == 'skip_current_run':
                     stream.output_queue.push(('progress_update', (None, f'Run {run_index}/{num_runs} skipped.', make_progress_bar_html(100, 'Skipped'), (run_index) / num_runs)))
-                    # If skipping the first run, we need a placeholder pixel history
-                    if history_pixels is None:
-                        if not high_vram: load_model_as_complete(vae, target_device=gpu)
-                        history_pixels = vae_decode(start_latent, vae).cpu()
-                        if not high_vram: unload_complete_models(vae)
                     continue
                 elif signal == 'stop_all_runs':
                     stream.output_queue.push(('progress_update', (None, 'All runs stopped.', make_progress_bar_html(100, 'Stopped'), 1.0)))
                     break
+            
+            # Save intermediate cumulative video
+            output_filename = os.path.join(session_folder, f'run_{run_index}_cumulative.mp4')
+            save_bcthw_as_mp4(history_pixels, output_filename, fps=30, crf=mp4_crf)
+            stream.output_queue.push(('file', output_filename))
 
         # --- Final Output ---
         if history_pixels is not None and save_as_png_sequence:
@@ -354,24 +367,28 @@ def process(k1, k2, k3, k4, k5, p1, p2, p3, p4, p5, n_prompt, open_ended, seed, 
             preview, desc, html, overall_progress = data
             yield gr.update(), gr.update(visible=True, value=preview), desc, html, overall_progress*100, gr.update(interactive=False), gr.update(interactive=True), gr.update(interactive=True)
         elif flag == 'end':
-            yield output_filename, gr.update(visible=False), gr.update(), '', 0.0, gr.update(interactive=True), gr.update(interactive=False), gr.update(interactive=False)
+            yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(), gr.update(interactive=True), gr.update(interactive=False), gr.update(interactive=False)
             break
 
 def skip_current_run():
+    # Push only if there isn't already a command, to prevent queue buildup
     if stream.input_queue.top() is None:
         stream.input_queue.push('skip_current_run')
 
 def stop_all_runs():
+    # Push only if there isn't already a command
     if stream.input_queue.top() is None:
         stream.input_queue.push('stop_all_runs')
 
 def update_ui_based_on_inputs(num_additional_keyframes, is_open_ended, k1, k2, k3, k4, k5):
     num_additional = int(num_additional_keyframes)
     
+    # Keyframe visibility
     kf3_vis = gr.update(visible=num_additional >= 1)
     kf4_vis = gr.update(visible=num_additional >= 2)
     kf5_vis = gr.update(visible=num_additional >= 3)
     
+    # Calculate number of runs based on *actual* inputs
     all_kf_inputs = [k1, k2, k3, k4, k5]
     num_valid_keyframes = sum(1 for kf in all_kf_inputs[:2+num_additional] if kf is not None)
     
@@ -379,6 +396,7 @@ def update_ui_based_on_inputs(num_additional_keyframes, is_open_ended, k1, k2, k
     if is_open_ended and num_valid_keyframes > 0:
         num_runs += 1
         
+    # Prompt visibility
     p2_vis = gr.update(visible=num_runs >= 2)
     p3_vis = gr.update(visible=num_runs >= 3)
     p4_vis = gr.update(visible=num_runs >= 4)
@@ -432,7 +450,7 @@ with block:
                 
                 lengths_per_run_str = gr.Textbox(label="Video Lengths Per Run (seconds)", value="4", info="Comma-separated list (e.g., '4, 2, 5'). If fewer values than runs, the last value is used for all remaining runs.")
                 
-                latent_window_size = gr.Slider(label="Latent Window Size (Anchors)", minimum=3, maximum=25, value=9, step=2, info="Larger values produce more coherent motion but use more VRAM. ODD NUMBERS ARE STRONGLY RECOMMENDED.")
+                latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)
                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
                 gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Changing this value is not recommended.')
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB)", minimum=6, maximum=128, value=6, step=0.1, info="Larger value causes slower speed but helps avoid OOM.")
