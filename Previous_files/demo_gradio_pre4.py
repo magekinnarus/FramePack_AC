@@ -150,9 +150,9 @@ def worker(all_keyframes, all_prompts, n_prompt, perform_open_ended, seed, incre
     try:
         # --- Initialization ---
         stream.output_queue.push(('progress_update', (None, 'Initializing...', make_progress_bar_html(0, 'Init...'), 0.0)))
-        H_init, W_init, C_init = keyframe_sequence[0].shape
-        height, width = find_nearest_bucket(H_init, W_init, resolution=640)
-        session_history_pixels = None
+        H, W, C = keyframe_sequence[0].shape
+        height, width = find_nearest_bucket(H, W, resolution=640)
+        history_pixels = None
 
         # --- Main Orchestration Loop (Per Storyboard Run) ---
         for i in range(num_runs):
@@ -215,8 +215,7 @@ def worker(all_keyframes, all_prompts, n_prompt, perform_open_ended, seed, incre
                     latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
 
                 rnd = torch.Generator("cpu").manual_seed(current_seed_for_run)
-                current_run_pixels = None
-                run_chunk_history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
+                chunk_history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
                 total_generated_latent_frames_in_run = 0
 
                 for chunk_idx, latent_padding in enumerate(latent_paddings):
@@ -230,11 +229,11 @@ def worker(all_keyframes, all_prompts, n_prompt, perform_open_ended, seed, incre
                     clean_latent_indices_pre, _, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
                     clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
 
-                    clean_latents_pre = start_latent.to(run_chunk_history_latents)
-                    clean_latents_post, clean_latents_2x, clean_latents_4x = run_chunk_history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
+                    clean_latents_pre = start_latent.to(chunk_history_latents)
+                    clean_latents_post, clean_latents_2x, clean_latents_4x = chunk_history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
                     
                     if has_end_image and is_first_section:
-                        clean_latents_post = end_latent.to(run_chunk_history_latents)
+                        clean_latents_post = end_latent.to(chunk_history_latents)
                     
                     clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
                     
@@ -256,7 +255,7 @@ def worker(all_keyframes, all_prompts, n_prompt, perform_open_ended, seed, incre
                         current_step = d['i'] + 1
                         percentage = int(100.0 * current_step / steps)
                         hint = f'Sampling {current_step}/{steps}'
-                        desc = f'Run {run_index}/{num_runs}, Chunk {chunk_idx+1}/{len(latent_paddings)}. Total video length: {((session_history_pixels.shape[2] if session_history_pixels is not None else 0) / 30.0):.2f}s'
+                        desc = f'Run {run_index}/{num_runs}, Chunk {chunk_idx+1}/{len(latent_paddings)}. Total video length: {((history_pixels.shape[2] if history_pixels is not None else 0) / 30.0):.2f}s'
                         run_progress = (i + (chunk_idx + current_step/steps) / len(latent_paddings)) / num_runs
                         stream.output_queue.push(('progress_update', (preview, desc, make_progress_bar_html(percentage, hint), run_progress)))
 
@@ -279,46 +278,40 @@ def worker(all_keyframes, all_prompts, n_prompt, perform_open_ended, seed, incre
                         generated_latents_chunk = torch.cat([start_latent.to(generated_latents_chunk), generated_latents_chunk], dim=2)
                     
                     total_generated_latent_frames_in_run += generated_latents_chunk.shape[2]
-                    run_chunk_history_latents = torch.cat([generated_latents_chunk.to(run_chunk_history_latents), run_chunk_history_latents], dim=2)
+                    chunk_history_latents = torch.cat([generated_latents_chunk.to(chunk_history_latents), chunk_history_latents], dim=2)
 
                     if not high_vram:
                         offload_model_from_device_for_memory_preservation(transformer, gpu, 8)
                         load_model_as_complete(vae, gpu)
 
-                    real_chunk_history_latents = run_chunk_history_latents[:, :, :total_generated_latent_frames_in_run]
+                    real_chunk_history_latents = chunk_history_latents[:, :, :total_generated_latent_frames_in_run]
 
-                    # Build up the pixels for the *current run only*
-                    if current_run_pixels is None:
-                        current_run_pixels = vae_decode(real_chunk_history_latents, vae).cpu()
+                    if history_pixels is None:
+                        history_pixels = vae_decode(real_chunk_history_latents, vae).cpu()
                     else:
                         section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                         overlapped_frames = latent_window_size * 4 - 3
                         
                         current_pixels = vae_decode(real_chunk_history_latents[:, :, :section_latent_frames], vae).cpu()
-                        current_run_pixels = soft_append_bcthw(current_pixels, current_run_pixels, overlapped_frames)
+                        history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
 
                     if not high_vram: unload_complete_models()
-                
+
+                    output_filename = os.path.join(session_folder, f'run_{run_index}_cumulative.mp4')
+                    save_bcthw_as_mp4(history_pixels, output_filename, fps=30, crf=mp4_crf)
+                    stream.output_queue.push(('file', output_filename))
+                    
                     if is_last_section:
                         break # Exit the inner chunking loop for this run
             
-                # --- End of Run: Append run pixels to session history ---
-                if session_history_pixels is None:
-                    session_history_pixels = current_run_pixels
-                else:
-                    session_history_pixels = soft_append_bcthw(session_history_pixels, current_run_pixels, overlap=1)
-            
-                output_filename = os.path.join(session_folder, f'run_{run_index}_cumulative.mp4')
-                save_bcthw_as_mp4(session_history_pixels, output_filename, fps=30, crf=mp4_crf)
-                stream.output_queue.push(('file', output_filename))
-
             except KeyboardInterrupt:
                 signal = stream.input_queue.pop()
                 if signal == 'skip_current_run':
                     stream.output_queue.push(('progress_update', (None, f'Run {run_index}/{num_runs} skipped.', make_progress_bar_html(100, 'Skipped'), (run_index) / num_runs)))
-                    if session_history_pixels is None:
+                    # If skipping the first run, we need a placeholder pixel history
+                    if history_pixels is None:
                         if not high_vram: load_model_as_complete(vae, target_device=gpu)
-                        session_history_pixels = vae_decode(start_latent, vae).cpu()
+                        history_pixels = vae_decode(start_latent, vae).cpu()
                         if not high_vram: unload_complete_models(vae)
                     continue
                 elif signal == 'stop_all_runs':
@@ -326,10 +319,10 @@ def worker(all_keyframes, all_prompts, n_prompt, perform_open_ended, seed, incre
                     break
 
         # --- Final Output ---
-        if session_history_pixels is not None and save_as_png_sequence:
+        if history_pixels is not None and save_as_png_sequence:
             stream.output_queue.push(('progress_update', (None, f'Saving final PNG sequence...', make_progress_bar_html(100, 'Saving...'), 1.0)))
             png_sequence_dir = os.path.join(session_folder, 'png_sequence')
-            save_bcthw_as_png_sequence(session_history_pixels, png_sequence_dir)
+            save_bcthw_as_png_sequence(history_pixels, png_sequence_dir)
 
     except Exception:
         traceback.print_exc()
